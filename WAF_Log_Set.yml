@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: WAF Log automatic setting
+Parameters:
+  S3BucketName:
+    Description: Please enter your s3 bucket name
+    Type: String
+    Default: aws-waf-logs-
+Resources:
+  EventBridgeStepFunctionsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !GetAtt MyStateMachine.Arn
+  StepFunctuonsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AWSWAFFullAccess
+      Path: "/"
+      Policies:
+        - PolicyName: CloudWatchLogsDeliveryFullAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  -  "logs:CreateLogDelivery"
+                  -  "logs:GetLogDelivery"
+                  -  "logs:UpdateLogDelivery"
+                  -  "logs:DeleteLogDelivery"
+                  -  "logs:ListLogDeliveries"
+                  -  "logs:PutResourcePolicy"
+                  -  "logs:DescribeResourcePolicies"
+                  -  "logs:DescribeLogGroups"
+                Resource: "*"
+        - PolicyName: XRayAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  -  "xray:PutTraceSegments"
+                  -  "xray:PutTelemetryRecords"
+                  -  "xray:GetSamplingRules"
+                  -  "xray:GetSamplingTargets"
+                Resource: "*"
+  MyStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunction/my-step-function
+      RetentionInDays: 14
+  MyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: waf_set_event_functions
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+             LogGroupArn: !GetAtt MyStateMachineLogGroup.Arn
+        IncludeExecutionData: True
+        Level: ALL
+      DefinitionString:
+       !Sub
+          - |-
+            {
+              "Comment": "A description of my state machine",
+              "StartAt": "PutLoggingConfiguration",
+              "States": {
+                "PutLoggingConfiguration": {
+                  "Type": "Task",
+                  "End": true,
+                  "Parameters": {
+                    "LoggingConfiguration": {
+                      "LogDestinationConfigs": [
+                        "arn:aws:s3:::${SetS3BucketName}"
+                      ],
+                      "ResourceArn.$": "$.aRN"
+                    }
+                    },
+                  "Resource": "arn:aws:states:::aws-sdk:wafv2:putLoggingConfiguration"
+                }
+              }
+            }
+          - {
+            SetS3BucketName: !Ref S3BucketName
+            }
+      RoleArn: !GetAtt [ StepFunctuonsRole, Arn ]
+  WAFLogSetEventBridge:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Routes to us-east-1 event bus
+      Name: 'WAFLogSetEventBridge'
+      EventBusName: default
+      State: ENABLED
+      EventPattern: |
+        {
+          "source": ["aws.wafv2"],
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventSource": ["wafv2.amazonaws.com"],
+            "eventName": ["CreateWebACL"]
+          }
+        }
+      Targets:
+        - Id: "StepFunctions"
+          Arn: !Ref MyStateMachine
+          InputPath: $.detail.responseElements.summary
+          RoleArn: !GetAtt [ EventBridgeStepFunctionsRole, Arn ]
